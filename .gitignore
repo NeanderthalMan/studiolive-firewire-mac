@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+npm-debug.log*
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editors
+.idea/
+.vscode/
+
+# Local env
+.env
+.env.local
+
+# Machine facts captured by scripts/probe-firewire.sh
+var/
+
+# Built spike binaries
+spike/fwprobe
+spike/isoprobe
+spike/names
+build/
+*.wav
+
+# Claude Code worktrees (local, per session)
+.claude/worktrees/
+.claude/worktrees-retired/
