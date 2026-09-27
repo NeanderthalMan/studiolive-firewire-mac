@@ -41,6 +41,11 @@ typedef struct {
 typedef struct {
     uint64_t callbacks, packets, data_packets, bad_packets;
     uint64_t frames, dbc_breaks, frames_lost;
+    /* The longest wait between two DCL call-backs on this stream, in µs.
+     * Nominally 4000 (32 packets); what it grows to is how late a reader can
+     * find frames it expected, so it is the first thing to read after an
+     * underrun. */
+    uint32_t worst_callback_gap_us;
     bool     running, force_stopped;
 } slfw_stats;
 

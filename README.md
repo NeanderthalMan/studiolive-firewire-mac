@@ -39,11 +39,11 @@ Exactly one setup, and only this:
 | Console | StudioLive **24.4.2AI** |
 | Mac | MacBook Pro, **M4 Pro**, macOS **15.1** |
 | Adapters | Apple Thunderbolt to FireWire Adapter (**A1463**) → Apple Thunderbolt 3 (USB-C) to Thunderbolt 2 Adapter (**A1790**) → a Thunderbolt port on the Mac |
-| DAW | Studio One **5.5.2**, through an aggregate device |
+| DAW | Studio One **5.5.2**, on the device directly or through an aggregate |
 
-On that setup Core Audio lists **StudioLive FireWire** with 40 inputs at
-44.1 kHz, a 10-second recording through Core Audio has no gaps with all 40
-channels live, and Studio One records from it.
+On that setup Core Audio lists **StudioLive FireWire** with 40 inputs and a
+2-channel sink output at 44.1 kHz, a 10-second recording through Core Audio has
+no gaps with all 40 channels live, and Studio One records from it.
 
 **Untested:** the other AI mixers (16.4.2AI, 32.4.2AI, RM16AI, RM32AI), other
 Apple Silicon Macs, other macOS versions, and 48 kHz. The DICE protocol they
@@ -71,6 +71,7 @@ under `var/`, which is gitignored because it includes serial numbers.
 
 ```sh
 make                                          # the driver, the recorder and the checks
+make test                                     # unit tests; no console or sudo needed
 build/halcheck build/StudioLiveFW.driver 20   # drives the plug-in in a plain process; console must be on the bus
 sudo scripts/install-driver.sh                # copies it to /Library/Audio/Plug-Ins/HAL and restarts Core Audio
 build/cacheck 10                              # records 10 s THROUGH Core Audio; must say PASSED
@@ -85,20 +86,70 @@ with administrator privileges'`.
 
 Core Audio then lists **StudioLive FireWire**: one input per console stream
 channel, named as the console names them — on the 24.4.2AI, CH1–CH24 and
-AUX1–AUX16.
+AUX1–AUX16 — and a stereo output named **Not connected 1** and **Not connected
+2**, which is exactly what it says.
 
 To remove it: `sudo scripts/uninstall-driver.sh`.
 
-## Recording in Studio One 5
-
-Studio One 5 uses a single device for both recording and playback, and this
-driver is input-only. So it records through an **aggregate device** that adds an
-output for playback:
+### The menu bar icon
 
 ```sh
-build/mkaggregate --list                     # audio devices and their channel counts
-build/mkaggregate "MacBook Pro Speakers"     # or any output device, by name substring
+scripts/install-menu.sh        # copies build/StudioLiveMenu.app to ~/Applications and starts it
 ```
+
+A waveform in the menu bar says whether the driver has a console and is
+streaming, without opening anything:
+
+| icon | means |
+|---|---|
+| waveform, struck through | no console on the FireWire bus, or the driver is not loaded |
+| waveform | console present, nothing recording from it |
+| filled waveform circle | streaming to an app |
+| warning triangle | audio was lost in the last minute, or the aggregate's output device is not drift-compensated |
+
+Clicking it shows the console, its rate, how long the stream has been up,
+frames lost, read underruns and the worst call-back gap. It offers to turn on
+drift compensation when the aggregate needs it, and to open Audio MIDI Setup
+or copy all of that for a bug report. **Open at Login** starts it with the Mac.
+The numbers come from the driver through Core Audio, so it needs a driver
+built from this version or later; an older one shows as present with nothing
+more.
+
+## Recording in Studio One 5
+
+Studio One uses a single device for both recording and playback, and will not
+run its engine on a device with no outputs. So the driver publishes a stereo
+output of its own — **Not connected 1** and **Not connected 2** — and discards
+whatever is written to it. That is enough to select **StudioLive FireWire**
+directly, with no aggregate and no second interface:
+
+1. **Studio One ▸ Preferences… ▸ Audio Setup ▸ Audio Device** → **StudioLive
+   FireWire**. The song rate must match the console's rate (44.1 kHz on the
+   tested console).
+2. **Song ▸ Song Setup ▸ Audio I/O Setup ▸ Inputs** — add a mono input per
+   console channel you want; they are named as the console names them.
+3. Make audio tracks, pick those inputs, arm, record.
+
+Nothing will be audible from the Mac, including playback of the take you just
+recorded. That is the trade: monitoring belongs on the console, where it has no
+latency, and the console is where the audio already is.
+
+### To hear playback too: an aggregate
+
+Add a real output device with an **aggregate device**. Any output that can run
+at the console's rate will do — built-in speakers are fine, no extra hardware
+needed:
+
+```sh
+build/mkaggregate --list                     # audio devices, their channel counts and rates
+build/mkaggregate "MacBook Pro Speakers"     # or any output device, by name
+```
+
+The name picks the output device whose whole name matches, ignoring case, or
+else the only one whose name contains what you typed — `"AudioBox"` is enough
+when there is one AudioBox. If that part matches more than one output device,
+`mkaggregate` lists them and stops; give a full name. There is only ever one
+StudioLive aggregate: running it again replaces the last one.
 
 That creates **StudioLive + \<output device\>**, with the console as clock master
 — recorded audio is never resampled; the output device is drift-compensated
@@ -110,14 +161,27 @@ instead. On a 24.4.2AI its inputs are numbered:
 | 25–40 | console AUX1–AUX16 |
 | 41 and up | the output device's own inputs, if it has any |
 
-In Studio One:
+The console comes first in the aggregate, so its own sink comes first among the
+outputs as well, and **the audible outputs are 3 and 4**:
+
+| aggregate outputs | goes to |
+|---|---|
+| 1–2 | the driver's sink — *Not connected 1* and *2*, discarded |
+| 3 and up | the output device |
+
+Core Audio recomputes a sub-device's channel counts from the device itself, so
+there is no way to ask it to leave the sink out. The names are the defence:
+*Not connected* says what it is wherever Studio One lists it.
+
+Then, in Studio One:
 
 1. **Studio One ▸ Preferences… ▸ Audio Setup ▸ Audio Device** → the
    *StudioLive + …* aggregate. The song rate must match the console's rate
    (44.1 kHz on the tested console).
 2. **Song ▸ Song Setup ▸ Audio I/O Setup ▸ Inputs** — add a mono input per
    console channel you want and tick its number from the table above.
-3. Make audio tracks, pick those inputs, arm, record.
+3. **▸ Outputs** — the **Main** row wants **3 + 4**, not 1 + 2.
+4. Make audio tracks, pick those inputs, arm, record.
 
 **Monitor on the console.** Its headphone and monitor outputs have no latency.
 Audio monitored through Studio One comes back through the aggregate's output
@@ -127,25 +191,53 @@ setting plays every input back a second time, late.
 
 ### Meters move, but there is no sound
 
-Capture is working; playback has nowhere to go. Check the aggregate still has
-outputs:
+On **StudioLive FireWire** on its own, that is the design: its only outputs are
+the sink. Monitor on the console, or build an aggregate as above.
+
+On the aggregate, check its output device is still attached:
 
 ```sh
-build/mkaggregate --list          # "StudioLive + ..." must show out 2 (or more)
+build/mkaggregate --list          # "StudioLive + ..." must show more outs than the sink's 2
 build/tone "StudioLive + " 3      # a 440 Hz tone through the same device Studio One uses
 ```
 
-`out 0` means the aggregate's output device has dropped off the Mac, typically a
+The console alone contributes 40 in and the sink's 2 out, so **out 2 with in 40**
+is the aggregate saying its output device has dropped off the Mac — typically a
 USB interface that was unplugged. Plugging it back in is enough: the aggregate
 keeps it in its configuration and reattaches it without a rebuild.
 
 If the tone is audible and Studio One is not, the problem is inside the song:
 
-1. **Song ▸ Song Setup ▸ Audio I/O Setup ▸ Outputs** — the **Main** row must have
-   outputs 1 + 2 ticked. Check this **even if the metronome plays**: the click can
-   be routed on its own, so hearing it does not prove Main is assigned.
+1. **Song ▸ Song Setup ▸ Audio I/O Setup ▸ Outputs** — the **Main** row must be
+   ticked on the audible pair, which on the aggregate is **3 + 4**; 1 + 2 are the
+   driver's sink and are silent by design. Check this **even if the metronome
+   plays**: the click can be routed on its own, so hearing it does not prove Main
+   is assigned.
 2. To hear the console's inputs through the Mac, turn on the track's **monitor**
    button. Expect a 25–40 ms round trip; the console's own outputs have none.
+
+### After the console changes sample rate
+
+The aggregate follows the console to its new rate, but Core Audio leaves the
+output device at the old one. `build/mkaggregate --list` says so when the two
+disagree, and one command fixes it without rebuilding anything:
+
+```sh
+build/mkaggregate --sync          # moves the output device to the console's rate, and checks drift compensation
+```
+
+Change the song's sample rate in Studio One to match the console as well.
+
+### Clicks every minute or two
+
+A regular click or crackle through the aggregate — about every 2 minutes at a
+256-sample block size, every minute at 128 — is the output device's clock
+drifting against the console's, and a bigger block size only spaces the clicks
+out. The aggregate needs drift compensation on the output device.
+`build/mkaggregate --list` says when it is off, and `--sync` turns it on; it
+applies the next time Studio One starts audio, so switch the audio device away
+and back, or restart Studio One. Aggregates made by `mkaggregate` before this
+check existed were built with it off.
 
 ## Tools
 
@@ -154,8 +246,10 @@ If the tone is audible and Studio One is not, the problem is inside the song:
 | `build/slrecord -s 60 -o take.wav` | every channel to one WAV, bypassing Core Audio, with a level table |
 | `build/halcheck build/StudioLiveFW.driver 20` | loads the plug-in in an ordinary process and drives it the way Core Audio would — run before installing any change |
 | `build/cacheck 10` | an ordinary Core Audio client recording from the installed driver — the end-to-end check |
-| `build/mkaggregate --list` / `"<output>"` | lists audio devices / builds the Studio One aggregate |
+| `build/mkaggregate --list` / `"<output>"` / `--sync` | lists audio devices and their rates / builds the Studio One aggregate / puts its output device back at the console's rate and turns its drift compensation on |
 | `build/tone "<device>" [seconds] [left\|right\|both]` | a 440 Hz test tone out of a named device |
+| `make test` | unit tests for the depacketiser, clock fit, I/O path and menu logic — no console or sudo needed |
+| `scripts/install-menu.sh` | installs and starts the menu bar icon |
 
 The driver opens the console only while some app is doing I/O, so `slrecord` and
 the spikes work whenever nothing is recording through Core Audio, and fail with

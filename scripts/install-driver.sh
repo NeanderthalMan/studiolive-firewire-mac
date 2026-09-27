@@ -5,6 +5,7 @@
 # Restarting coreaudiod cuts all audio on the Mac for a second or two.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
+. "$here/scripts/driver-helpers.sh"
 src=$here/build/StudioLiveFW.driver
 dst=/Library/Audio/Plug-Ins/HAL/StudioLiveFW.driver
 [[ $EUID -eq 0 ]] || { echo "needs root: sudo $0" >&2; exit 1; }
@@ -12,5 +13,5 @@ dst=/Library/Audio/Plug-Ins/HAL/StudioLiveFW.driver
 rm -rf "$dst"
 cp -R "$src" "$dst"
 chown -R root:wheel "$dst"
-killall coreaudiod   # kickstart is SIP-blocked on macOS 15; launchd relaunches it
+restart_core_audio
 echo "installed $dst and restarted Core Audio"

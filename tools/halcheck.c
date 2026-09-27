@@ -112,7 +112,8 @@ int main(int argc, char **argv)
     get(dev, kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput, 0, sizeof streams, streams, &got);
     CHECK(got == sizeof(AudioObjectID), "one input stream, got %u bytes", got);
     get(dev, kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput, 0, sizeof outstreams, outstreams, &got);
-    CHECK(got == 0, "no output streams, got %u bytes", got);
+    UInt32 nout = got / (UInt32)sizeof(AudioObjectID);
+    CHECK(nout == 1, "one output stream (the sink), got %u bytes", got);
     AudioObjectID stream = streams[0];
 
     AudioStreamBasicDescription f;
@@ -127,6 +128,26 @@ int main(int argc, char **argv)
     AudioObjectPropertyAddress bad = { kAudioObjectPropertyElementName, kAudioObjectPropertyScopeInput, ch + 1 };
     CHECK(!(*D)->HasProperty(D, dev, getpid(), &bad), "element name beyond the last channel should not exist");
 
+    /* The sink. It carries no audio anywhere; it is there so a host will open
+     * the device at all, without an aggregate built around a second interface. */
+    if (nout == 1) {
+        AudioStreamBasicDescription sf;
+        get(outstreams[0], kAudioStreamPropertyVirtualFormat, kAudioObjectPropertyScopeGlobal, 0, sizeof sf, &sf, NULL);
+        printf("stream %u (sink)\n  %-24s %.0f Hz, %u ch, %u-bit float\n", outstreams[0], "format",
+               sf.mSampleRate, sf.mChannelsPerFrame, sf.mBitsPerChannel);
+        CHECK(fabs(sf.mSampleRate - rate) < 0.5, "sink rate matches device");
+        CHECK(sf.mChannelsPerFrame == 2, "sink is stereo, got %u ch", sf.mChannelsPerFrame);
+        UInt32 dir = 1;
+        get(outstreams[0], kAudioStreamPropertyDirection, kAudioObjectPropertyScopeGlobal, 0, sizeof dir, &dir, NULL);
+        CHECK(dir == 0, "sink direction should be output, got %u", dir);
+        str("sink channel 1 name", dev, kAudioObjectPropertyElementName, kAudioObjectPropertyScopeOutput, 1);
+        /* If macOS could make this the default output, everything the Mac plays
+         * would go silently into it. */
+        UInt32 dflt = 1;
+        get(dev, kAudioDevicePropertyDeviceCanBeDefaultDevice, kAudioObjectPropertyScopeOutput, 0, sizeof dflt, &dflt, NULL);
+        CHECK(dflt == 0, "the sink must never be selectable as the default output");
+    }
+
     /* ----- I/O, paced like Core Audio: read behind "now" by the safety offset ----- */
     printf("I/O for %.0f s\n", secs);
     uint64_t t0 = mach_absolute_time();
@@ -135,6 +156,20 @@ int main(int argc, char **argv)
     double ns_per_tick = (double)tb.numer / tb.denom;
     printf("  %-24s %d after %.0f ms\n", "StartIO", (int)r, (mach_absolute_time() - t0) * ns_per_tick / 1e6);
     if (r != noErr) { printf("  FAIL: StartIO\n"); return 1; }
+
+    if (nout == 1) {
+        /* One WriteMix: the driver must claim the operation and swallow the
+         * buffer without reading it. */
+        Boolean will = false, inplace = false;
+        (*D)->WillDoIOOperation(D, dev, 1, kAudioServerPlugInIOOperationWriteMix, &will, &inplace);
+        CHECK(will, "the driver must claim WriteMix, or its output is unusable");
+        Float32 sink[2 * 64];
+        for (unsigned i = 0; i < 2 * 64; i++) sink[i] = 0.5f;
+        AudioServerPlugInIOCycleInfo ci = { 0 };
+        OSStatus wr = (*D)->DoIOOperation(D, dev, outstreams[0], 1,
+                                          kAudioServerPlugInIOOperationWriteMix, 64, &ci, sink, NULL);
+        CHECK(wr == noErr, "WriteMix returned %d", (int)wr);
+    }
 
     const UInt32 N = 512;
     Float32 *buf = calloc((size_t)N * ch, sizeof(Float32));

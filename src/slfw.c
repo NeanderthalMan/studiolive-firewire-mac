@@ -6,11 +6,13 @@
 #include <IOKit/firewire/IOFireWireLibIsoch.h>
 #include <libkern/OSByteOrder.h>
 #include <mach/mach_time.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ---------------------------------------------------------------- addresses */
 
@@ -96,6 +98,8 @@ struct slfw {
 
     _Atomic uint64_t                callbacks, packets, data_packets, bad_packets,
                                     dbc_breaks, frames_lost;
+    uint64_t                        last_callback;            /* run-loop thread only */
+    _Atomic uint64_t                worst_gap;                /* mach ticks */
 };
 
 static slfw *g_self;
@@ -146,6 +150,117 @@ static void quiesce(slfw *s)
     if (s->gbase) wr(s, s->gbase + G_ENABLE, 0);
     if (s->tbase) wr(s, s->tbase + TX_BLOCK0 + TX_ISOC, 0xffffffff);
     s->enabled = false;
+}
+
+/* ------------------------------------------------------------- crash guard
+ *
+ * A process that dies while it owns a streaming isoch channel does not just
+ * lose the console: it wedges the whole FireWire stack until the Mac reboots.
+ *
+ * Seen 2026-09-20 on the test Mac, ioreg dump kept under var/. The HAL
+ * plug-in's host process (com.apple.audio.DriverHelper) died mid-stream. The
+ * IOFireWireUserClient it had created was left `!registered, inactive, busy 1`
+ * with the creating pid long gone, and that stuck user client pinned both
+ * IOFireWireDevice and IOFireWireController at `inactive, busy 2` — a
+ * termination that had not finished four minutes later and never would. While
+ * it sat there nothing re-enumerated: system_profiler still listed the console
+ * (at "Connection Speed: Unknown", the corpse's giveaway), IOFireWireLib found
+ * no device, the plug-in published none, and unplugging and replugging the
+ * whole adapter chain did not clear it. Only a reboot did.
+ *
+ * slfw_close already drains the tidy path — see the note there about the one
+ * user client leaked per recording. This is the other half: the paths where
+ * slfw_close is never reached at all. We cannot make that airtight, because
+ * SIGKILL (jetsam, Force Quit, `killall -9 coreaudiod`) runs no code and a
+ * panic runs less; the honest goal is to cover every death we CAN see, since
+ * the alternative costs a reboot.
+ *
+ * Three deliberate choices:
+ *
+ *  - It lives here, not in each tool, because this file owns the resource that
+ *    wedges. slrecord had an atexit hook and the plug-in had nothing — and the
+ *    plug-in is the one that wedged the machine.
+ *  - A signal handler may only call async-signal-safe functions, and IOKit is
+ *    not. We call it anyway: a possible hang in a process that is already dying
+ *    beats a certain reboot. alarm() bounds the gamble — SIGALRM's default
+ *    action kills us, which is where we were headed.
+ *  - We take a signal only where the disposition is still SIG_DFL, so we never
+ *    silently displace a handler the host installed. That is why slrecord's own
+ *    SIGINT/SIGTERM handlers, installed after slfw_open, still win: its tidy
+ *    stop is better than our blunt one.
+ */
+
+static const int panic_sigs[] = {
+    SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP, SIGSYS,
+    SIGQUIT, SIGTERM, SIGINT, SIGHUP, SIGXCPU,
+};
+#define N_PANIC_SIGS (sizeof panic_sigs / sizeof panic_sigs[0])
+
+static struct sigaction panic_old[N_PANIC_SIGS];
+static bool            panic_hooked[N_PANIC_SIGS];
+static volatile sig_atomic_t panicking;
+
+/* The smallest set of calls that leaves nothing pinned in the kernel: give the
+ * isoch channel back, tell the console to stop talking, close the device. No
+ * Release, no run-loop drain — those need a live process, and this one is not.
+ * Runs once, from a signal handler or from atexit, on any thread. */
+static void panic_release(void)
+{
+    slfw *s = g_self;
+    if (!s) return;
+    alarm(3);
+    if (s->chan && (atomic_load(&s->running) || s->enabled)) {
+        (*s->chan)->Stop(s->chan);
+        (*s->chan)->ReleaseChannel(s->chan);
+    }
+    atomic_store(&s->running, false);
+    quiesce(s);
+    if (s->dev && s->opened) (*s->dev)->Close(s->dev);
+    s->opened = false;
+    g_self = NULL;
+}
+
+static void panic_handler(int sig)
+{
+    if (!panicking) { panicking = 1; panic_release(); }
+    /* Put every disposition back and re-raise, so the crash report is still
+     * written and the exit status still names the signal that killed us. A
+     * hardware trap would re-fault on return anyway; raising is just explicit. */
+    for (unsigned i = 0; i < N_PANIC_SIGS; i++)
+        if (panic_hooked[i]) { sigaction(panic_sigs[i], &panic_old[i], NULL); panic_hooked[i] = false; }
+    raise(sig);
+}
+
+static void panic_guard_install(void)
+{
+    static bool at_exit_done;
+    if (!at_exit_done) { atexit(panic_release); at_exit_done = true; }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = panic_handler;
+    sa.sa_flags = SA_ONSTACK;            /* helps if the host set an alt stack */
+    sigfillset(&sa.sa_mask);
+
+    for (unsigned i = 0; i < N_PANIC_SIGS; i++) {
+        struct sigaction cur;
+        if (panic_hooked[i] || sigaction(panic_sigs[i], NULL, &cur) != 0) continue;
+        if (cur.sa_handler != SIG_DFL) continue;          /* the host owns it */
+        if (sigaction(panic_sigs[i], &sa, &panic_old[i]) == 0) panic_hooked[i] = true;
+    }
+}
+
+static void panic_guard_remove(void)
+{
+    for (unsigned i = 0; i < N_PANIC_SIGS; i++) {
+        if (!panic_hooked[i]) continue;
+        struct sigaction cur;
+        /* Only take back what is still ours: a host that installed its own
+         * handler after us must keep it. */
+        if (sigaction(panic_sigs[i], NULL, &cur) == 0 && cur.sa_handler == panic_handler)
+            sigaction(panic_sigs[i], &panic_old[i], NULL);
+        panic_hooked[i] = false;
+    }
 }
 
 /* ---------------------------------------------------------------- the clock */
@@ -320,12 +435,25 @@ static void process_slot(slfw *s, unsigned slot)
     atomic_store(&s->wpos, w);
 }
 
+/* Call-backs come every 32 packets, 4 ms. One that comes late delays every
+ * frame in its group, and a reader timed off the clock fit finds them missing:
+ * that is a read underrun with the stream itself intact. */
+static void note_callback(slfw *s, uint64_t now)
+{
+    if (s->last_callback && now > s->last_callback) {
+        uint64_t gap = now - s->last_callback;
+        if (gap > atomic_load(&s->worst_gap)) atomic_store(&s->worst_gap, gap);
+    }
+    s->last_callback = now;
+}
+
 static void dcl_proc(DCLCommand *cmd)
 {
     slfw *s = g_self;
     if (!s || !atomic_load(&s->running)) return;
     unsigned end = (unsigned)(uintptr_t)((DCLCallProc *)cmd)->procData;
     atomic_fetch_add(&s->callbacks, 1);
+    note_callback(s, mach_absolute_time());
     for (unsigned i = end + 1 - GROUP; i <= end; i++) process_slot(s, i);
     clock_observe(s, atomic_load(&s->wpos), mach_absolute_time());
 }
@@ -370,6 +498,10 @@ void slfw_get_stats(slfw *s, slfw_stats *o)
     o->frames        = atomic_load(&s->wpos);
     o->dbc_breaks    = atomic_load(&s->dbc_breaks);
     o->frames_lost   = atomic_load(&s->frames_lost);
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    uint64_t us = atomic_load(&s->worst_gap) * tb.numer / tb.denom / 1000;
+    o->worst_callback_gap_us = us > UINT32_MAX ? UINT32_MAX : (uint32_t)us;
     o->running       = atomic_load(&s->running);
     o->force_stopped = atomic_load(&s->force_stopped);
 }
@@ -471,6 +603,9 @@ slfw *slfw_open(io_service_t svc, CFRunLoopRef rl, slfw_log_fn log, char *err, s
     s->log = log;
     s->rl = rl;
     g_self = s;
+    /* Before the device is opened, not after: a crash part-way through the
+     * open leaves the same wedge as a crash mid-stream. */
+    panic_guard_install();
 
     SInt32 score;
     if (IOCreatePlugInInterfaceForService(svc, kIOFireWireLibTypeID, kIOCFPlugInInterfaceID,
@@ -609,6 +744,8 @@ int slfw_start(slfw *s)
     atomic_store(&s->wpos, 0);
     s->have_dbc = false;
     s->fdf_checked = false;
+    s->last_callback = 0;
+    atomic_store(&s->worst_gap, 0);
     atomic_store(&s->force_stopped, false);
     clock_reset(s);
 
@@ -677,5 +814,6 @@ void slfw_close(slfw *s)
     free(s->ring);
     free(s->pktbuf);
     if (g_self == s) g_self = NULL;
+    panic_guard_remove();          /* nothing left to rescue */
     free(s);
 }

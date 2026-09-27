@@ -8,7 +8,13 @@
  * this file is the Core Audio object model and the I/O cycle.
  *
  * Objects: the plug-in, one device (published while a PreSonus console is on
- * the bus), and one input stream carrying every tx[0] channel.
+ * the bus), one input stream carrying every tx[0] channel, and a stereo output
+ * stream that discards whatever is written to it. The output exists so a DAW
+ * will open the device at all — Studio One will not run its engine on a device
+ * with no outputs — which is what lets the console be recorded without building
+ * an aggregate around a second interface. Monitoring belongs on the console's
+ * own outputs, which have no latency, so nothing is meant to be heard from the
+ * Mac, until playback over FireWire replaces the sink with real returns.
  *
  * Threads:
  *   - a private "FireWire" thread runs a CFRunLoop that owns everything
@@ -32,7 +38,9 @@
 
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <dispatch/dispatch.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/thread_policy.h>
 #include <math.h>
 #include <os/log.h>
 #include <pthread.h>
@@ -40,7 +48,8 @@
 #include <string.h>
 #include <unistd.h>
 
-enum { kObj_PlugIn = kAudioObjectPlugInObject, kObj_Device = 2, kObj_Stream = 3 };
+enum { kObj_PlugIn = kAudioObjectPlugInObject, kObj_Device = 2, kObj_Stream = 3,
+       kObj_StreamOut = 4 };
 
 /* Frames per zero-timestamp period; must exceed any I/O buffer size. */
 #define kZeroTSPeriod   16384
@@ -50,6 +59,14 @@ enum { kObj_PlugIn = kAudioObjectPlugInObject, kObj_Device = 2, kObj_Stream = 3 
 #define kSafetyOffset   1024
 #define kLatencyFrames  256
 #define kMaxIOFrames    16384
+/* The driver's own state, as a custom device property for the menu bar app:
+ * a CFDictionary, so a new key never breaks an old reader. */
+#define kSLFWPropertyStatus 'slst'
+
+/* Channels on the sink. Two is the smallest a host will treat as a usable
+ * output, and every extra one would be another silent destination in the DAW's
+ * output list for no present gain. */
+#define kSinkChannels   2
 
 static os_log_t                 gLog;
 static AudioServerPlugInHostRef gHost;
@@ -67,6 +84,10 @@ static _Atomic UInt32           gClients;
 static _Atomic bool             gRunning;
 static int32_t                 *gScratch;
 static _Atomic uint64_t         gUnderruns;
+/* The last short read, for health() to log: where the cycle asked to read and
+ * where the writer was. Written only on the I/O thread; a torn triple costs a
+ * misleading log line, never audio. */
+static _Atomic uint64_t         gShortPos, gShortFrames, gShortWriter;
 static double                   gLastTpf, gLastBaseHost;
 static uint64_t                 gLastBaseFrame;
 static uint32_t                 gLastSeed;
@@ -188,29 +209,57 @@ static uint64_t guid_of(io_service_t svc)
     return v;
 }
 
+/* A console that is on the bus but could not be opened. Arrival notifications
+ * fire once per device, so without this a console busy at that moment stays
+ * unpublished until Core Audio restarts. That happened on 2026-09-27: the old
+ * driver's helper outlived an install's coreaudiod restart and held the console
+ * for a minute, and the new driver's one attempt failed with exclusive access.
+ * health() retries while it is set. */
+static _Atomic bool             gRetryProbe;
+
+/* FireWire thread. Read the console's identity and publish the device. */
+static bool probe(io_service_t svc, bool quiet)
+{
+    char err[256];
+    slfw *s = slfw_open(svc, gFWRunLoop, quiet ? NULL : fwlog, err, sizeof err);
+    if (!s) {
+        if (!quiet) os_log_error(gLog, "console found but could not be opened: %{public}s; retrying every 2 s", err);
+        atomic_store(&gRetryProbe, true);
+        return false;
+    }
+    pthread_mutex_lock(&gLock);
+    gInfo = *slfw_get_info(s);
+    pthread_mutex_unlock(&gLock);
+    slfw_close(s);
+    atomic_store(&gRetryProbe, false);
+    atomic_store(&gPresent, true);
+    os_log(gLog, "console present: %{public}s, %u channels at %u Hz",
+           gInfo.nickname, gInfo.channels, gInfo.sample_rate);
+    notify(kObj_PlugIn, kAudioPlugInPropertyDeviceList);
+    notify(kObj_PlugIn, kAudioObjectPropertyOwnedObjects);
+    return true;
+}
+
 static void arrivals(void *ref, io_iterator_t it)
 {
     io_service_t svc;
     while ((svc = IOIteratorNext(it))) {
-        if (!atomic_load(&gPresent) && (guid_of(svc) >> 40) == 0x000a92) {
-            char err[256];
-            slfw *s = slfw_open(svc, gFWRunLoop, fwlog, err, sizeof err);
-            if (s) {
-                pthread_mutex_lock(&gLock);
-                gInfo = *slfw_get_info(s);
-                pthread_mutex_unlock(&gLock);
-                slfw_close(s);
-                atomic_store(&gPresent, true);
-                os_log(gLog, "console present: %{public}s, %u channels at %u Hz",
-                       gInfo.nickname, gInfo.channels, gInfo.sample_rate);
-                notify(kObj_PlugIn, kAudioPlugInPropertyDeviceList);
-                notify(kObj_PlugIn, kAudioObjectPropertyOwnedObjects);
-            } else {
-                os_log_error(gLog, "console found but could not be opened: %{public}s", err);
-            }
-        }
+        if (!atomic_load(&gPresent) && (guid_of(svc) >> 40) == 0x000a92) probe(svc, false);
         IOObjectRelease(svc);
     }
+}
+
+/* FireWire thread, from health(): try a busy console again. Quiet, because it
+ * runs every other second for as long as the console stays busy. */
+static void retry_probe(void)
+{
+    static unsigned tries;
+    if (atomic_load(&gPresent) || !atomic_load(&gRetryProbe)) { tries = 0; return; }
+    if (++tries % 2) return;
+    io_service_t svc = slfw_find_service(0);
+    if (!svc) { atomic_store(&gRetryProbe, false); tries = 0; return; }   /* it left the bus */
+    if (probe(svc, true)) os_log(gLog, "console opened on retry %u", tries / 2);
+    IOObjectRelease(svc);
 }
 
 static void removals(void *ref, io_iterator_t it)
@@ -264,10 +313,12 @@ static void reopen_stream(const char *why)
 static void health(CFRunLoopTimerRef t, void *info)
 {
     static uint64_t last_breaks, last_lost, last_under, last_frames;
+    static uint32_t last_gap_logged;
     static uint64_t win_frames, win_packets;
     static bool win_open;
     static int still;
     slfw *fw = atomic_load(&gFW);          /* FireWire thread: nothing else frees it */
+    retry_probe();
     if (!atomic_load(&gRunning) || !atomic_load(&gPresent)) { still = 0; win_open = false; return; }
     if (!fw) {
         /* A reopen failed: keep trying every other second while I/O runs. */
@@ -342,16 +393,55 @@ static void health(CFRunLoopTimerRef t, void *info)
     }
     uint64_t under = atomic_load(&gUnderruns);
     if (st.dbc_breaks != last_breaks || st.frames_lost != last_lost || under != last_under) {
-        os_log(gLog, "stats: frames %llu, DBC breaks %llu, frames lost %llu, read underruns %llu",
-               st.frames, st.dbc_breaks, st.frames_lost, under);
+        os_log(gLog, "stats: frames %llu, DBC breaks %llu, frames lost %llu, read underruns %llu, worst call-back gap %.1f ms",
+               st.frames, st.dbc_breaks, st.frames_lost, under, st.worst_callback_gap_us / 1000.0);
+        if (under != last_under) {
+            uint64_t pos = atomic_load(&gShortPos), n = atomic_load(&gShortFrames), w = atomic_load(&gShortWriter);
+            os_log(gLog, "last short read: frames [%llu, %llu) with the writer at %llu — %{public}s by %lld frames",
+                   pos, pos + n, w, pos + n > w ? "ahead of the writer" : "behind the ring",
+                   pos + n > w ? (long long)(pos + n - w) : (long long)(w - pos));
+        }
         last_breaks = st.dbc_breaks; last_lost = st.frames_lost; last_under = under;
     }
+    /* A gap past a quarter of the safety offset is worth a line even with no
+     * underrun yet: it is how close the next one came. */
+    uint32_t warn_us = (uint32_t)(kSafetyOffset * 250000.0 / (gInfo.sample_rate ? gInfo.sample_rate : 44100));
+    if (st.worst_callback_gap_us > warn_us && st.worst_callback_gap_us > last_gap_logged * 1.25) {
+        os_log(gLog, "worst call-back gap now %.1f ms (safety offset is %.1f ms)", st.worst_callback_gap_us / 1000.0,
+               kSafetyOffset * 1000.0 / (gInfo.sample_rate ? gInfo.sample_rate : 44100));
+        last_gap_logged = st.worst_callback_gap_us;
+    }
+}
+
+/* The DCL call-backs that fill the ring run on this thread, and the reader
+ * allows them kSafetyOffset (23 ms) to be late. At default priority a busy Mac
+ * can take that from them: 3 frames came up short once in five hours on
+ * 2026-09-26 with the stream itself intact. So it runs time-constrained, like
+ * Core Audio's own I/O threads: a call-back every 4 ms needing well under 1 ms.
+ * The thread also opens and closes the device, but that work blocks in IOKit
+ * rather than computing, so it does not trip the scheduler's fail-safe. */
+static void make_realtime(void)
+{
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    double per_ms = 1e6 * (double)tb.denom / (double)tb.numer;
+    thread_time_constraint_policy_data_t p = {
+        .period      = (uint32_t)(4 * per_ms),
+        .computation = (uint32_t)(0.5 * per_ms),
+        .constraint  = (uint32_t)(4 * per_ms),
+        .preemptible = true,
+    };
+    kern_return_t r = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
+                                        (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    if (r == KERN_SUCCESS) os_log(gLog, "FireWire thread is time-constrained");
+    else os_log_error(gLog, "FireWire thread stays at default priority: thread_policy_set %d", r);
 }
 
 static void *fw_thread(void *arg)
 {
     dispatch_semaphore_t ready = arg;
     pthread_setname_np("StudioLiveFW FireWire");
+    make_realtime();
     gFWRunLoop = (CFRunLoopRef)CFRetain(CFRunLoopGetCurrent());
 
     gNotify = IONotificationPortCreate(kIOMainPortDefault);
@@ -380,9 +470,8 @@ static CFStringRef cfstr(const char *fmt, ...)
     return CFStringCreateWithCString(NULL, b, kCFStringEncodingUTF8);
 }
 
-static AudioStreamBasicDescription stream_format(void)
+static AudioStreamBasicDescription stream_format(UInt32 ch)
 {
-    UInt32 ch = gInfo.channels;
     AudioStreamBasicDescription f = {
         .mSampleRate = gInfo.sample_rate, .mFormatID = kAudioFormatLinearPCM,
         .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked,
@@ -390,6 +479,48 @@ static AudioStreamBasicDescription stream_format(void)
         .mChannelsPerFrame = ch, .mBitsPerChannel = 32,
     };
     return f;
+}
+
+static void dict_num(CFMutableDictionaryRef d, CFStringRef k, CFNumberType t, const void *v)
+{
+    CFNumberRef n = CFNumberCreate(NULL, t, v);
+    CFDictionarySetValue(d, k, n);
+    CFRelease(n);
+}
+
+/* Built fresh on each read, on whatever thread Core Audio asks from. The
+ * stream is pinned the way the I/O thread pins it, so release_stream cannot
+ * free it mid-read. */
+static CFDictionaryRef status_dict(void)
+{
+    CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                         &kCFTypeDictionaryValueCallBacks);
+    SInt32 running = atomic_load(&gRunning), clients = (SInt32)atomic_load(&gClients);
+    SInt32 rate = (SInt32)advertised_rate(), ch = (SInt32)gInfo.channels;
+    SInt64 under = (SInt64)atomic_load(&gUnderruns);
+    dict_num(d, CFSTR("running"), kCFNumberSInt32Type, &running);
+    dict_num(d, CFSTR("clients"), kCFNumberSInt32Type, &clients);
+    dict_num(d, CFSTR("sample rate"), kCFNumberSInt32Type, &rate);
+    dict_num(d, CFSTR("channels"), kCFNumberSInt32Type, &ch);
+    dict_num(d, CFSTR("read underruns"), kCFNumberSInt64Type, &under);
+    CFStringRef nick = cfstr("%s", gInfo.nickname);
+    CFDictionarySetValue(d, CFSTR("console"), nick);
+    CFRelease(nick);
+
+    atomic_fetch_add(&gInIO, 1);
+    slfw *fw = atomic_load(&gFW);
+    if (fw) {
+        slfw_stats st;
+        slfw_get_stats(fw, &st);
+        SInt64 frames = (SInt64)st.frames, breaks = (SInt64)st.dbc_breaks, lost = (SInt64)st.frames_lost;
+        SInt32 gap = (SInt32)st.worst_callback_gap_us;
+        dict_num(d, CFSTR("frames"), kCFNumberSInt64Type, &frames);
+        dict_num(d, CFSTR("DBC breaks"), kCFNumberSInt64Type, &breaks);
+        dict_num(d, CFSTR("frames lost"), kCFNumberSInt64Type, &lost);
+        dict_num(d, CFSTR("worst call-back gap us"), kCFNumberSInt32Type, &gap);
+    }
+    atomic_fetch_sub(&gInIO, 1);
+    return d;
 }
 
 /* One function answers "does it exist", "how big" and "what is it": with out
@@ -447,9 +578,29 @@ static OSStatus prop(AudioObjectID obj, const AudioObjectPropertyAddress *a,
         case kAudioObjectPropertyName:            PUTCF(cfstr("%s FireWire", gInfo.nickname));
         case kAudioObjectPropertyManufacturer:    PUTCF(CFSTR("PreSonus"));
         case kAudioObjectPropertyOwnedObjects:
-        case kAudioDevicePropertyStreams:         PUTIDS(output ? 0 : 1, kObj_Stream);
+        case kAudioDevicePropertyStreams: {
+            /* Asked in the global scope, both streams; in a directed scope, the
+             * one that faces that way. */
+            AudioObjectID ids[2];
+            UInt32 n = 0;
+            if (!output) ids[n++] = kObj_Stream;
+            if (!input)  ids[n++] = kObj_StreamOut;
+            *outsz = n * sizeof(AudioObjectID);
+            if (!out) return noErr;
+            if (insz < *outsz) *outsz = insz / sizeof(AudioObjectID) * sizeof(AudioObjectID);
+            memcpy(out, ids, *outsz);
+            return noErr;
+        }
         case kAudioObjectPropertyControlList:     PUTIDS(0, 0);
-        case kAudioObjectPropertyCustomPropertyInfoList: SIZE(0); return noErr;
+        case kAudioObjectPropertyCustomPropertyInfoList: {
+            SIZE(sizeof(AudioServerPlugInCustomPropertyInfo));
+            AudioServerPlugInCustomPropertyInfo i = { kSLFWPropertyStatus,
+                kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone };
+            *(AudioServerPlugInCustomPropertyInfo *)out = i;
+            return noErr;
+        }
+        case kSLFWPropertyStatus:                 SIZE(sizeof(CFPropertyListRef));
+                                                  *(CFPropertyListRef *)out = status_dict(); return noErr;
         case kAudioDevicePropertyDeviceUID:       PUTCF(cfstr("slfw:%012llx", gInfo.guid));
         case kAudioDevicePropertyModelUID:        PUTCF(CFSTR("slfw:StudioLiveAI"));
         case kAudioDevicePropertyTransportType:   PUT(UInt32, kAudioDeviceTransportTypeFireWire);
@@ -487,32 +638,43 @@ static OSStatus prop(AudioObjectID obj, const AudioObjectPropertyAddress *a,
         }
         case kAudioObjectPropertyElementName:
             /* This is what puts "CH1", "AUX3" on Studio One's input list. */
-            if (!input || a->mElement < 1 || a->mElement > ch) return kAudioHardwareUnknownPropertyError;
-            PUTCF(cfstr("%s", gInfo.names[a->mElement - 1]));
+            if (input) {
+                if (a->mElement < 1 || a->mElement > ch) return kAudioHardwareUnknownPropertyError;
+                PUTCF(cfstr("%s", gInfo.names[a->mElement - 1]));
+            }
+            /* Say plainly where the output goes, so silence reads as the design
+             * and not as a fault. */
+            if (output) {
+                if (a->mElement < 1 || a->mElement > kSinkChannels) return kAudioHardwareUnknownPropertyError;
+                PUTCF(cfstr("Not connected %u", (unsigned)a->mElement));
+            }
+            return kAudioHardwareUnknownPropertyError;
         }
         return kAudioHardwareUnknownPropertyError;
     }
 
-    if (obj == kObj_Stream) {
+    if (obj == kObj_Stream || obj == kObj_StreamOut) {
         if (!present) return kAudioHardwareBadObjectError;
+        bool sink = obj == kObj_StreamOut;
+        UInt32 sch = sink ? kSinkChannels : ch;
         switch (sel) {
         case kAudioObjectPropertyBaseClass:       PUT(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass:           PUT(AudioClassID, kAudioStreamClassID);
         case kAudioObjectPropertyOwner:           PUT(AudioObjectID, kObj_Device);
-        case kAudioObjectPropertyName:            PUTCF(CFSTR("Console"));
+        case kAudioObjectPropertyName:            PUTCF(sink ? CFSTR("Not connected") : CFSTR("Console"));
         case kAudioObjectPropertyOwnedObjects:    PUTIDS(0, 0);
         case kAudioObjectPropertyCustomPropertyInfoList: SIZE(0); return noErr;
         case kAudioStreamPropertyIsActive:        PUT(UInt32, 1);
-        case kAudioStreamPropertyDirection:       PUT(UInt32, 1);
+        case kAudioStreamPropertyDirection:       PUT(UInt32, sink ? 0 : 1);
         case kAudioStreamPropertyTerminalType:    PUT(UInt32, kAudioStreamTerminalTypeLine);
         case kAudioStreamPropertyStartingChannel: PUT(UInt32, 1);
         case kAudioStreamPropertyLatency:         PUT(UInt32, 0);
         case kAudioStreamPropertyVirtualFormat:
-        case kAudioStreamPropertyPhysicalFormat:  PUT(AudioStreamBasicDescription, stream_format());
+        case kAudioStreamPropertyPhysicalFormat:  PUT(AudioStreamBasicDescription, stream_format(sch));
         case kAudioStreamPropertyAvailableVirtualFormats:
         case kAudioStreamPropertyAvailablePhysicalFormats: {
             SIZE(sizeof(AudioStreamRangedDescription));
-            AudioStreamRangedDescription r = { stream_format(), { gInfo.sample_rate, gInfo.sample_rate } };
+            AudioStreamRangedDescription r = { stream_format(sch), { gInfo.sample_rate, gInfo.sample_rate } };
             *(AudioStreamRangedDescription *)out = r;
             return noErr;
         }
@@ -542,9 +704,10 @@ static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID o
     /* The console owns its clock. Rate and format writes are accepted only when
      * they ask for what it already is, so hosts that set them still work. */
     *outSettable = (obj == kObj_Device && a->mSelector == kAudioDevicePropertyNominalSampleRate) ||
-                   (obj == kObj_Stream && (a->mSelector == kAudioStreamPropertyVirtualFormat ||
-                                           a->mSelector == kAudioStreamPropertyPhysicalFormat ||
-                                           a->mSelector == kAudioStreamPropertyIsActive));
+                   ((obj == kObj_Stream || obj == kObj_StreamOut) &&
+                    (a->mSelector == kAudioStreamPropertyVirtualFormat ||
+                     a->mSelector == kAudioStreamPropertyPhysicalFormat ||
+                     a->mSelector == kAudioStreamPropertyIsActive));
     return noErr;
 }
 
@@ -571,15 +734,17 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj,
         if (insz < sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
         return fabs(*(const Float64 *)data - gInfo.sample_rate) < 0.5 ? noErr : kAudioDeviceUnsupportedFormatError;
     }
-    if (obj == kObj_Stream && (a->mSelector == kAudioStreamPropertyVirtualFormat ||
-                               a->mSelector == kAudioStreamPropertyPhysicalFormat)) {
+    if ((obj == kObj_Stream || obj == kObj_StreamOut) &&
+        (a->mSelector == kAudioStreamPropertyVirtualFormat ||
+         a->mSelector == kAudioStreamPropertyPhysicalFormat)) {
         if (insz < sizeof(AudioStreamBasicDescription)) return kAudioHardwareBadPropertySizeError;
         const AudioStreamBasicDescription *f = data;
-        AudioStreamBasicDescription mine = stream_format();
+        AudioStreamBasicDescription mine = stream_format(obj == kObj_StreamOut ? kSinkChannels : gInfo.channels);
         return (fabs(f->mSampleRate - mine.mSampleRate) < 0.5 && f->mChannelsPerFrame == mine.mChannelsPerFrame &&
                 f->mFormatID == mine.mFormatID) ? noErr : kAudioDeviceUnsupportedFormatError;
     }
-    if (obj == kObj_Stream && a->mSelector == kAudioStreamPropertyIsActive) return noErr;
+    if ((obj == kObj_Stream || obj == kObj_StreamOut) &&
+        a->mSelector == kAudioStreamPropertyIsActive) return noErr;
     return kAudioHardwareUnsupportedOperationError;
 }
 
@@ -697,7 +862,10 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID dev
 static OSStatus WillDoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client,
                                   UInt32 op, Boolean *outWillDo, Boolean *outInPlace)
 {
-    *outWillDo = (op == kAudioServerPlugInIOOperationReadInput);
+    /* WriteMix is what a host uses to hand over its mixed output. Claiming it
+     * is what makes the device full-duplex; the audio is then dropped. */
+    *outWillDo = (op == kAudioServerPlugInIOOperationReadInput ||
+                  op == kAudioServerPlugInIOOperationWriteMix);
     *outInPlace = true;
     return noErr;
 }
@@ -710,6 +878,8 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev, A
                               UInt32 client, UInt32 op, UInt32 frames,
                               const AudioServerPlugInIOCycleInfo *cycle, void *main, void *secondary)
 {
+    /* WriteMix lands here and returns without reading the buffer: that is the
+     * sink. Everything below is the input path. */
     if (op != kAudioServerPlugInIOOperationReadInput) return noErr;
     UInt32 ch = gInfo.channels;
     Float32 *out = main;
@@ -723,9 +893,15 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev, A
 
     double t = cycle->mInputTime.mSampleTime;
     uint64_t pos = t > 0 ? (uint64_t)llround(t) : 0;
+    uint64_t writer = slfw_frames(fw);
     unsigned real = slfw_read(fw, pos, gScratch, frames);
     atomic_fetch_sub(&gInIO, 1);
-    if (real < frames) atomic_fetch_add(&gUnderruns, frames - real);
+    if (real < frames) {
+        atomic_store(&gShortPos, pos);
+        atomic_store(&gShortFrames, frames);
+        atomic_store(&gShortWriter, writer);
+        atomic_fetch_add(&gUnderruns, frames - real);
+    }
 
     const Float32 k = 1.0f / 2147483648.0f;
     size_t n = (size_t)frames * ch;
@@ -775,10 +951,13 @@ static OSStatus PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d, A
     pthread_mutex_unlock(&gLock);
     notify(kObj_Device, kAudioDevicePropertyNominalSampleRate);
     notify(kObj_Device, kAudioDevicePropertyAvailableNominalSampleRates);
-    notify(kObj_Stream, kAudioStreamPropertyVirtualFormat);
-    notify(kObj_Stream, kAudioStreamPropertyPhysicalFormat);
-    notify(kObj_Stream, kAudioStreamPropertyAvailableVirtualFormats);
-    notify(kObj_Stream, kAudioStreamPropertyAvailablePhysicalFormats);
+    AudioObjectID streams[2] = { kObj_Stream, kObj_StreamOut };
+    for (int i = 0; i < 2; i++) {
+        notify(streams[i], kAudioStreamPropertyVirtualFormat);
+        notify(streams[i], kAudioStreamPropertyPhysicalFormat);
+        notify(streams[i], kAudioStreamPropertyAvailableVirtualFormats);
+        notify(streams[i], kAudioStreamPropertyAvailablePhysicalFormats);
+    }
     os_log(gLog, "now advertising %u Hz", rate);
     return noErr;
 }
